@@ -1,0 +1,384 @@
+import dask.dataframe as dd
+import dask.array as da
+from dask.distributed import Client, progress 
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+import dask_ml.feature_extraction.text as dml_text
+import dask_ml.linear_model as dml_linear_model
+from dask_ml.metrics import accuracy_score as dml_accuracy_score
+import os
+
+from datasets import load_dataset 
+from scipy.sparse import csr_matrix # Ensure this is imported
+
+# --- Configuration ---
+USE_SUBSET = False 
+SUBSET_FRAC = 0.5 
+
+NUM_PARTITIONS = 20     
+MAX_FEATURES_TFIDF = 5000 
+RANDOM_STATE = 42
+
+# --- 1. Dataset Selection & Loading (No changes) ---
+def load_ag_news_from_huggingface(num_partitions, use_subset=False, subset_frac=1.0):
+    print("\n--- Loading AG News Dataset from Hugging Face datasets library ---")
+    
+    dataset = load_dataset("ag_news")
+    
+    train_hf_dataset = dataset["train"]
+    test_hf_dataset = dataset["test"]
+
+    print("Converting Hugging Face 'train' split to Pandas DataFrame...")
+    train_df = train_hf_dataset.to_pandas()
+    
+    print("Converting Hugging Face 'test' split to Pandas DataFrame...")
+    test_df = test_hf_dataset.to_pandas()
+
+    if use_subset:
+        print(f"Using a subset of {subset_frac*100}% of the data for faster testing.")
+        train_df = train_df.sample(frac=subset_frac, random_state=RANDOM_STATE)
+        test_df = test_df.sample(frac=subset_frac, random_state=RANDOM_STATE)
+    
+    if train_df.empty:
+        raise ValueError("Train DataFrame is empty after loading/sampling. Cannot proceed.")
+    if test_df.empty:
+        raise ValueError("Test DataFrame is empty after loading/sampling. Cannot proceed.")
+
+    train_df['text'] = train_df['text'].astype(str).fillna('')
+    test_df['text'] = test_df['text'].astype(str).fillna('')
+    
+    initial_train_rows = len(train_df)
+    initial_test_rows = len(test_df)
+    train_df = train_df[train_df['text'].str.strip() != '']
+    test_df = test_df[test_df['text'].str.strip() != '']
+
+    if len(train_df) < initial_train_rows:
+        print(f"WARNING: Removed {initial_train_rows - len(train_df)} empty/whitespace text rows from train set.")
+    if len(test_df) < initial_test_rows:
+        print(f"WARNING: Removed {initial_test_rows - len(test_df)} empty/whitespace text rows from test set.")
+
+    ddf_train = dd.from_pandas(train_df, npartitions=num_partitions)
+    ddf_test = dd.from_pandas(test_df, npartitions=num_partitions // 2)
+
+    ddf_train = ddf_train.rename(columns={'label': 'target'})
+    ddf_test = ddf_test.rename(columns={'label': 'target'})
+    
+    ddf_train = ddf_train[['text', 'target']]
+    ddf_test = ddf_test[['text', 'target']]
+
+    print(f"Final Dask DataFrame for train: {ddf_train.npartitions} partitions, columns: {list(ddf_train.columns)}")
+    print(f"Final Dask DataFrame for test: {ddf_test.npartitions} partitions, columns: {list(ddf_test.columns)}")
+    
+    return ddf_train, ddf_test
+
+# --- 2. Dask Setup (No changes) ---
+def setup_dask_client():
+    print("\n--- Setting up Dask Client ---")
+    client = Client(n_workers=NUM_PARTITIONS, threads_per_worker=2, memory_limit='6GB') 
+    print(f"Dask Dashboard: {client.dashboard_link}")
+    return client
+
+# --- 3. Data Preprocessing (TF-IDF) ---
+def preprocess_data_dask(ddf, vectorizer):
+    print("\n--- Dask Data Preprocessing (TF-IDF) ---")
+    
+    ddf['text'] = ddf['text'].astype(str)
+
+    meta_output_series = pd.Series([csr_matrix((0, MAX_FEATURES_TFIDF), dtype=np.float64)], dtype=object)
+
+    X_series_of_sparse_matrices = ddf['text'].map_partitions(
+        lambda s: vectorizer.transform(s),
+        meta=meta_output_series
+    )
+    
+    # Corrected: Use da.from_dask_dataframe (no underscore 'dd')
+    # and provide the correct shape including the column dimension.
+    X = X_series_of_sparse_matrices.map_partitions(lambda s: s.toarray().reshape(-1, MAX_FEATURES_TFIDF), meta=np.empty((0, MAX_FEATURES_TFIDF)))
+    X = X.compute_chunk_sizes()  # Ensure chunk sizes are known
+    
+    y = ddf['target'].to_dask_array(lengths=True)
+
+    try:
+        num_rows_X = X.shape[0] if isinstance(X.shape, tuple) and len(X.shape) > 0 else ddf.shape[0].compute()
+        print(f"Computed X.shape[0]: {num_rows_X}")
+    except Exception as e:
+        print(f"Failed to compute X.shape[0] (or it's already known): {e}")
+        num_rows_X = X.shape[0] if isinstance(X.shape, tuple) and len(X.shape) > 0 else X.compute().shape[0]
+        if isinstance(num_rows_X, float) and np.isnan(num_rows_X):
+            print("WARNING: X.shape[0] is still NaN after from_dask_dataframe. This is unexpected.")
+    
+    if isinstance(X.shape, tuple) and len(X.shape) > 1:
+       num_cols_X = X.shape[1]
+    else:
+       num_cols_X = MAX_FEATURES_TFIDF  # Default to expected feature count
+
+    print(f"Feature matrix (X) shape: ({num_rows_X}, {num_cols_X}), target (y) shape: {y.shape}")
+    return X, y, vectorizer
+
+# --- 4. Model Training (No changes) ---
+def train_model_dask(X_train, y_train):
+    print("\n--- Dask Model Training (Logistic Regression) ---")
+    model = dml_linear_model.LogisticRegression(solver='lbfgs', random_state=RANDOM_STATE, max_iter=100, C=0.1, multi_class='auto')
+    
+    start_time = time.time()
+    X_train = X_train.compute_chunk_sizes()  # Ensure known chunk sizes
+    y_train = y_train.compute_chunk_sizes()
+    model.fit(X_train, y_train)
+    end_time = time.time()
+    train_time = end_time - start_time
+    print(f"Dask model training completed in {train_time:.2f} seconds.")
+    return model, train_time
+
+# --- 5. Performance Analysis (No changes to logic, just call `preprocess_data_dask`) ---
+def compare_performance(ddf_train_full, ddf_test_full, client):
+    print("\n--- Performance Comparison (Dask vs. Traditional) ---")
+    
+    print("\n--- Running Traditional (Pandas/Scikit-learn) Approach on a small subset ---")
+    
+    sample_train_df = ddf_train_full.sample(frac=0.1, random_state=RANDOM_STATE).compute()
+    sample_test_df = ddf_test_full.sample(frac=0.1, random_state=RANDOM_STATE).compute()
+
+    if sample_train_df.empty or sample_test_df.empty:
+        print("Warning: Sampled DataFrames are empty. Skipping traditional comparison.")
+        return None, None, None
+
+    sample_train_df = sample_train_df[sample_train_df['text'].str.strip() != '']
+    sample_test_df = sample_test_df[sample_test_df['text'].str.strip() != '']
+
+    X_train_sample = sample_train_df['text']
+    y_train_sample = sample_train_df['target']
+    X_test_sample = sample_test_df['text']
+    y_test_sample = sample_test_df['target']
+
+    print(f"Traditional comparison on sample size: {len(X_train_sample)} (train), {len(X_test_sample)} (test) records.")
+
+    tfidf_vectorizer_sk = TfidfVectorizer(max_features=MAX_FEATURES_TFIDF)
+    X_train_tfidf_sk = tfidf_vectorizer_sk.fit_transform(X_train_sample)
+    X_test_tfidf_sk = tfidf_vectorizer_sk.transform(X_test_sample)
+
+    traditional_model = LogisticRegression(solver='lbfgs', random_state=RANDOM_STATE, max_iter=100, C=0.1, multi_class='auto')
+    start_time_sk = time.time()
+    traditional_model.fit(X_train_tfidf_sk, y_train_sample)
+    end_time_sk = time.time()
+    train_time_sk = end_time_sk - start_time_sk
+    print(f"Traditional model training completed in {train_time_sk:.2f} seconds.")
+
+    y_pred_sk = traditional_model.predict(X_test_tfidf_sk)
+    accuracy_sk = accuracy_score(y_test_sample, y_pred_sk)
+    print(f"Traditional Model Accuracy (on sample): {accuracy_sk:.4f}")
+
+    # --- Dask Approach Training and Evaluation ---
+    dask_vectorizer_full = dml_text.HashingVectorizer(n_features=MAX_FEATURES_TFIDF)
+    X_train_dask_full, y_train_dask_full, _ = preprocess_data_dask(ddf_train_full, dask_vectorizer_full)
+    X_test_dask_full, y_test_dask_full, _ = preprocess_data_dask(ddf_test_full, dask_vectorizer_full)
+
+    dask_model, dask_train_time = train_model_dask(X_train_dask_full, y_train_dask_full)
+
+    print("\n--- Evaluating Dask Model on Full Test Set ---")
+    start_time_pred_dask = time.time()
+    y_pred_dask = dask_model.predict(X_test_dask_full).compute()
+    end_time_pred_dask = time.time()
+    predict_time_dask = end_time_pred_dask - start_time_pred_dask
+
+    y_test_dask_computed = y_test_dask_full.compute()
+        
+    accuracy_dask = accuracy_score(y_test_dask_computed, y_pred_dask)
+    print(f"Dask Model Prediction Time: {predict_time_dask:.2f} seconds.")
+    print(f"Dask Model Accuracy: {accuracy_dask:.4f}")
+    
+    # These also need to be computed as Dask Delayed objects
+    num_dask_train_samples = ddf_train_full.shape[0].compute()
+    num_dask_test_samples = ddf_test_full.shape[0].compute()
+    
+    performance_results = {
+        "Traditional_Train_Time": train_time_sk,
+        "Traditional_Accuracy": accuracy_sk,
+        "Dask_Train_Time": dask_train_time,
+        "Dask_Prediction_Time": predict_time_dask,
+        "Dask_Accuracy": accuracy_dask,
+        "Traditional_Train_Sample_Size": len(X_train_sample),
+        "Traditional_Test_Sample_Size": len(X_test_sample),
+        "Dask_Train_Sample_Size": num_dask_train_samples,
+        "Dask_Test_Sample_Size": num_dask_test_samples
+    }
+    return performance_results, y_test_dask_computed, y_pred_dask
+
+# --- 6. Visualization (No changes) ---
+def visualize_results(performance_results, y_true, y_pred, project_name="DaskMLPipeline_AGNews"):
+    print("\n--- Visualizing Results ---")
+
+    if performance_results:
+        labels = ['Traditional (Sample)', 'Dask (Full/Subset)']
+        train_times = [performance_results['Traditional_Train_Time'], performance_results['Dask_Train_Time']]
+        accuracies = [performance_results['Traditional_Accuracy'], performance_results['Dask_Accuracy']]
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+        axes[0].bar(labels, train_times, color=['skyblue', 'lightcoral'])
+        axes[0].set_ylabel('Training Time (seconds)')
+        axes[0].set_title('Training Time Comparison')
+        axes[0].text(0, train_times[0], f'{train_times[0]:.2f}s (on {performance_results["Traditional_Train_Sample_Size"]} samples)', ha='center', va='bottom')
+        axes[0].text(1, train_times[1], f'{train_times[1]:.2f}s (on {performance_results["Dask_Train_Sample_Size"]} samples)', ha='center', va='bottom')
+        
+        axes[1].bar(labels, accuracies, color=['skyblue', 'lightcoral'])
+        axes[1].set_ylabel('Accuracy')
+        axes[1].set_title('Accuracy Comparison')
+        axes[1].set_ylim(0, 1)
+        axes[1].text(0, accuracies[0], f'{accuracies[0]:.4f}', ha='center', va='bottom')
+        axes[1].text(1, accuracies[1], f'{accuracies[1]:.4f}', ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.savefig(f"{project_name}_performance_comparison.png")
+        plt.show()
+    else:
+        print("Performance results not available for visualization.")
+
+    if y_true is not None and y_pred is not None:
+        cm = confusion_matrix(y_true, y_pred)
+        class_names = ['World', 'Sports', 'Business', 'Sci/Tech'] 
+        plt.figure(figsize=(10, 8)) 
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                    xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title('Dask Model Confusion Matrix (AG News)')
+        plt.savefig(f"{project_name}_confusion_matrix.png")
+        plt.show()
+
+    if y_true is not None and y_pred is not None:
+        print("\n--- Dask Model Classification Report ---")
+        print(classification_report(y_true, y_pred, target_names=class_names))
+
+# --- 7. Comprehensive Documentation (No changes) ---
+def generate_documentation(performance_results, project_name="DaskMLPipeline_AGNews"):
+    print("\n--- Generating Comprehensive Documentation ---")
+    
+    total_train_samples = performance_results.get('Dask_Train_Sample_Size', 'N/A')
+    total_test_samples = performance_results.get('Dask_Test_Sample_Size', 'N/A')
+    
+    doc_content = f"""
+# Scalable Machine Learning Pipeline with Dask: {project_name}
+
+## Project Goal
+To construct a scalable machine learning pipeline capable of handling large datasets, leveraging Dask for distributed computing, and comparing its performance against a traditional approach. This revised project uses the **AG News Corpus** via the Hugging Face `datasets` library for robust data loading.
+
+## 1. Dataset Selection & Management
+- **Dataset:** AG News Corpus (News Classification)
+- **Source:** Hugging Face `datasets` library (`load_dataset("ag_news")`)
+- **Storage:** The `datasets` library handles downloading and caching the dataset automatically, eliminating the need for manual URL management or extraction.
+- **Task:** Multi-class Text Classification (4 classes: World, Sports, Business, Sci/Tech)
+- **Data Size:** The original dataset contains 120,000 training samples and 7,600 test samples. This pipeline works with {total_train_samples} training samples and {total_test_samples} test samples after filtering empty text rows.
+- **Subset Usage:** `USE_SUBSET` is set to `{USE_SUBSET}`. If `True`, a fraction of `{SUBSET_FRAC*100}%` of the original dataset is used for faster demonstration. For AG News, we often use the full dataset as it's manageable.
+- **Loading:** Data is loaded using `datasets.load_dataset` and then converted into Pandas DataFrames, which are subsequently converted to Dask DataFrames. This approach ensures reliable access to the dataset.
+- **Preprocessing:** Empty or whitespace-only text rows are explicitly filtered out to prevent issues with feature extraction.
+- **Label Mapping:** AG News labels are inherently 0-3 in the Hugging Face version.
+- **Text Combination:** The 'text' column from the Hugging Face dataset is directly used as the feature.
+
+## 2. Dask Setup
+A `dask.distributed.Client` was set up to create a local Dask cluster.
+- **Number of Workers:** {NUM_PARTITIONS} (Adjusted based on your CPU cores for optimal performance)
+- **Threads per Worker:** 2
+- **Memory Limit per Worker:** 6GB (Increased to provide more buffer for sparse matrix operations)
+- **Dashboard Link:** (Look for the link printed in the console when the client starts)
+This setup allows simulating a distributed environment on a single machine by using multiple processes/threads. For production, this would involve connecting to a dedicated Dask cluster (e.g., via Dask Gateway, Kubernetes, YARN, or cloud services).
+
+## 3. Data Preprocessing
+The data preprocessing involved text vectorization using TF-IDF.
+- **Tool:** `dask_ml.feature_extraction.text.HashingVectorizer`
+- **Max Features:** {MAX_FEATURES_TFIDF}
+- **Why Dask-ML's HashingVectorizer?** It's efficient for large text datasets as it doesn't need to store the entire vocabulary in memory and works seamlessly with Dask's distributed arrays. This is crucial when dealing with millions of text documents.
+- **Output:** The preprocessed text data (`X`) is a `dask.array` of sparse matrices, and the target labels (`y`) are a `dask.array`. Explicit meta information is provided to Dask to help with sparse array shape inference.
+
+## 4. Model Training
+A Logistic Regression model was trained for the text classification task.
+- **Model:** `dask_ml.linear_model.LogisticRegression`
+- **Solver:** 'lbfgs' (Compatible with Dask-ML's GLM implementation)
+- **Regularization (C):** 0.1
+- **Multi-class Strategy:** 'auto' (let scikit-learn/dask-ml choose appropriate strategy for multiclass)
+- **Integration:** `dask-ml` provides scikit-learn compatible estimators that can operate directly on Dask DataFrames and Arrays, distributing the computation across the Dask cluster.
+
+## 5. Performance Analysis
+The performance of the Dask pipeline was compared against a traditional Pandas/Scikit-learn approach.
+- **Traditional Approach:** Performed on a small subset of the data (approximately {performance_results.get('Traditional_Train_Sample_Size', 'N/A')} training samples and {performance_results.get('Traditional_Test_Sample_Size', 'N/A')} test samples) due to memory constraints for handling the full dataset. Filtered for empty text rows for consistency.
+- **Metrics Compared:** Training Time, Accuracy.
+
+### Performance Results:
+| Metric                   | Traditional (Sample) | Dask ({'Full' if not USE_SUBSET else 'Subset'}) Dataset |
+| :----------------------- | :------------------- | :-------------------------------------------------------- |
+| Training Time (seconds)  | {performance_results.get('Traditional_Train_Time', 'N/A'):.2f} | {performance_results.get('Dask_Train_Time', 'N/A'):.2f} |
+| Prediction Time (seconds)| N/A                  | {performance_results.get('Dask_Prediction_Time', 'N/A'):.2f} |
+| Accuracy                 | {performance_results.get('Dask_Accuracy', 'N/A'):.4f} | {performance_results.get('Dask_Accuracy', 'N/A'):.4f} |
+
+**Observation:**
+- The primary advantage of Dask becomes evident when dealing with datasets that exceed single-machine memory. While the traditional approach might be faster on very small samples due to lower overhead, Dask enables processing the entire large dataset efficiently.
+- Dask's training time reflects computation on **{total_train_samples}** samples, whereas the traditional method is limited to a small, in-memory fraction.
+- The prediction time for the Dask model on the distributed test set (up to **{total_test_samples}** samples) demonstrates its capability for large-scale inference.
+
+## 6. Visualization
+- **Performance Comparison Bar Chart:** Visualizes training times and accuracies of both approaches.
+- **Confusion Matrix:** Shows the Dask model's performance on the test set, indicating correct and incorrect classifications for the 4 news categories.
+- **Classification Report:** Provides a detailed breakdown of precision, recall, and F1-score for each class.
+
+## 7. Deliverables (Code Structure)
+- `pipeline.py`: Contains all the Python code for dataset loading, setup, data preprocessing, training, and analysis.
+- `{project_name}_performance_comparison.png`: Bar chart visualizing training time and accuracy comparison.
+- `{project_name}_confusion_matrix.png`: Heatmap of the confusion matrix for the Dask model.
+- `{project_name}_README.md`: This comprehensive documentation file.
+- The AG News dataset will be cached by the `datasets` library, usually in a location like `~/.cache/huggingface/datasets`.
+
+## How to Run
+1.  **Update `requirements.txt`** if you haven't already with `datasets` and `scipy`. Run `pip install -r requirements.txt`.
+2.  Save the code as `pipeline.py`.
+3.  Run from your terminal: `python pipeline.py`
+4.  The script will automatically download and prepare the AG News dataset using the `datasets` library.
+5.  Observe the Dask dashboard link in the console for real-time monitoring of computations.
+
+## Future Improvements / Considerations
+-   **Cloud Integration:** For truly massive datasets, deploying Dask on cloud platforms (AWS, GCP, Azure) or a Kubernetes cluster would be essential.
+-   **Hyperparameter Tuning:** Integrate `dask_ml.model_selection.GridSearchCV` or `RandomizedSearchCV` for distributed hyperparameter optimization.
+-   **Alternative Text Vectorization:** Explore other Dask-compatible text embeddings or feature extraction methods (e.g., word embeddings if you can manage their size).
+-   **Model Persistence:** Save the trained Dask-ML model for later inference using `joblib` or `cloudpickle`.
+-   **More Complex Models:** Investigate Dask integrations with libraries like XGBoost or deep learning frameworks (TensorFlow/PyTorch) for distributed training of more complex models.
+-   **Robust Error Handling:** Enhance error handling and logging for production environments.
+    """
+    
+    with open(f"{project_name}_README.md", "w") as f:
+        f.write(doc_content)
+    print(f"Documentation saved to {project_name}_README.md")
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    client = None
+    try:
+        client = setup_dask_client()
+        
+        # 1. Dataset Loading from Hugging Face
+        ddf_train, ddf_test = load_ag_news_from_huggingface(NUM_PARTITIONS, USE_SUBSET, SUBSET_FRAC)
+
+        # 5. Performance Analysis (includes Dask training and evaluation within)
+        performance_results, y_test_computed, y_pred_computed = compare_performance(ddf_train, ddf_test, client)
+        
+        # 6. Visualization
+        if performance_results:
+            visualize_results(performance_results, y_test_computed, y_pred_computed)
+        
+        # 7. Deliverables: Documentation
+        generate_documentation(performance_results)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc() 
+    finally:
+        if client:
+            print("\n--- Closing Dask Client ---")
+            client.close()
+            print("Dask client closed.")

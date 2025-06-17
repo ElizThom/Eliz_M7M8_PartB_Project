@@ -1,0 +1,38 @@
+# requirements.txt
+# This file lists the Python packages and their versions required to run the Dask ML Pipeline.
+
+# Dask and Distributed for parallel and out-of-core computing
+dask==2023.3.2
+distributed==2023.3.2
+
+# Dask-ML for Dask-compatible machine learning algorithms
+dask-ml==2023.3.24
+
+# Scikit-learn for traditional ML comparison and base models
+scikit-learn==1.3.0
+
+# Pandas for data manipulation (Dask DataFrames are built on Pandas)
+pandas==1.5.3
+
+# NumPy for numerical operations (Dask Arrays are built on NumPy)
+numpy==1.26.0
+
+# Matplotlib for plotting and visualization
+matplotlib==3.8.0
+
+# Seaborn for enhanced statistical data visualization
+seaborn==0.13.0
+
+# Requests for downloading the dataset from a URL
+requests==2.31.0
+
+# Graphviz (optional, for visualizing Dask computation graphs if needed)
+# You might also need to install the system-level graphviz package separately (e.g., sudo apt-get install graphviz on Ubuntu)
+graphviz==0.20.1
+
+# NEW: Hugging Face datasets library for easy access to many public datasets
+datasets==2.19.1
+
+scipy==1.11.0
+
+bokeh==2.4.2
